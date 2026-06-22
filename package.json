@@ -1,0 +1,27 @@
+{
+  "name": "demo-app-ci",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test",
+    "start": "node app/server.js",
+    "lint": "eslint app test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chiendz11/demo-app-ci.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/chiendz11/demo-app-ci/issues"
+  },
+  "homepage": "https://github.com/chiendz11/demo-app-ci#readme",
+  "private": "true",
+  "devDependencies": {
+    "eslint": "^9.39.4"
+  }
+}
