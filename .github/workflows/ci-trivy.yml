@@ -95,6 +95,14 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Generate and upload SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.image.outputs.local_tag }}
+          format: spdx-json
+          artifact-name: sbom-${{ steps.image.outputs.short_sha }}.spdx.json
+          upload-artifact: true
+
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -104,13 +112,6 @@ jobs:
           vuln-type: os,library
           severity: HIGH,CRITICAL
           exit-code: '1'
-
-      - name: Generate and upload SBOM
-        uses: anchore/sbom-action@v0
-        with:
-          image: ${{ steps.image.outputs.local_tag }}
-          format: spdx-json
-          artifact-name: sbom-${{ steps.image.outputs.short_sha }}.spdx.json
 
       - name: Login to GHCR
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
