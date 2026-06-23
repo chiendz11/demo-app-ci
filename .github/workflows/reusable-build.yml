@@ -1,0 +1,79 @@
+name: Reusable Docker Build
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: Docker image name
+        required: true
+        type: string
+
+      image_tag:
+        description: Docker image tag
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: Build, scan, SBOM, and optionally push image
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Display image information
+        run: |
+          echo "Image name: ${{ inputs.image_name }}"
+          echo "Image tag: ${{ inputs.image_tag }}"
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          pull: true
+          load: true
+          tags: |
+            ${{ inputs.image_name }}:${{ inputs.image_tag }}
+            ${{ inputs.image_name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate and upload SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ inputs.image_name }}:${{ inputs.image_tag }}
+          format: spdx-json
+          artifact-name: sbom-${{ inputs.image_tag }}.spdx.json
+          upload-artifact: true
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ inputs.image_name }}:${{ inputs.image_tag }}
+          format: table
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+
+      - name: Login to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push "${{ inputs.image_name }}:${{ inputs.image_tag }}"
+          docker push "${{ inputs.image_name }}:latest"

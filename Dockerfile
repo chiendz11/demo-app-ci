@@ -12,6 +12,10 @@ RUN node --check server.js \
 
 FROM node:20-alpine AS runtime
 
+RUN apk upgrade --no-cache \
+    && rm -rf /usr/local/lib/node_modules/npm \
+    && rm -f /usr/local/bin/npm /usr/local/bin/npx
+
 LABEL org.opencontainers.image.title="day-5-node-app" \
       org.opencontainers.image.description="Simple Node.js HTTP app for Docker practice" \
       org.opencontainers.image.source="https://github.com/chiendz11/demo-app-ci" \
