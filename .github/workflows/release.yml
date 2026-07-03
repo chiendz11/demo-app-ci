@@ -43,6 +43,19 @@ jobs:
       - name: Run unit tests
         run: npm test
 
+      - name: Validate production Compose
+        env:
+          IMAGE_REF: ghcr.io/${{ github.repository_owner }}/demo-app:validation
+        run: docker compose -f deploy/compose.yml config --quiet
+
+      - name: Validate Nginx configuration
+        run: |
+          docker run --rm \
+            --add-host demo-app:127.0.0.1 \
+            --volume "$PWD/deploy/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro" \
+            nginx:alpine \
+            nginx -t
+
   build-image:
     name: Build and publish release image
     needs: verify-release
@@ -107,6 +120,9 @@ jobs:
       IMAGE_REF: ${{ needs.build-image.outputs.image_ref }}
 
     steps:
+      - name: Checkout deployment configuration
+        uses: actions/checkout@v5
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
@@ -124,6 +140,9 @@ jobs:
           : "${APPLICATION_URL:?APPLICATION_URL is required}"
           : "${IMAGE_REF:?IMAGE_REF is required}"
 
+          test -s deploy/compose.yml
+          test -s deploy/nginx/default.conf
+
           aws sts get-caller-identity
 
       - name: Deploy release through SSM
@@ -132,17 +151,37 @@ jobs:
         run: |
           set -euo pipefail
 
+          compose_b64="$(base64 --wrap=0 deploy/compose.yml)"
+          nginx_b64="$(base64 --wrap=0 deploy/nginx/default.conf)"
+
           parameters="$(
-            jq -cn --arg image "$IMAGE_REF" '{
+            jq -cn \
+              --arg image "$IMAGE_REF" \
+              --arg compose "$compose_b64" \
+              --arg nginx "$nginx_b64" \
+              '{
               commands: [
                 "set -eu",
-                ("docker pull " + $image),
                 "docker network inspect demo-app-observability >/dev/null",
-                "docker rm -f demo-app-previous >/dev/null 2>&1 || true",
-                "if docker container inspect demo-app >/dev/null 2>&1; then docker stop demo-app; docker rename demo-app demo-app-previous; fi",
+                "install -d -m 0755 /opt/demo-app/nginx",
+                "[ ! -f /opt/demo-app/compose.yml ] || cp /opt/demo-app/compose.yml /opt/demo-app/compose.yml.previous",
+                "[ ! -f /opt/demo-app/nginx/default.conf ] || cp /opt/demo-app/nginx/default.conf /opt/demo-app/nginx/default.conf.previous",
+                ("printf %s " + ($compose | @sh) + " | base64 -d > /opt/demo-app/compose.yml"),
+                ("printf %s " + ($nginx | @sh) + " | base64 -d > /opt/demo-app/nginx/default.conf"),
+                "cd /opt/demo-app",
+                "if [ -s .env ]; then cp .env .env.previous; else previous_image=$(docker inspect --format={{.Config.Image}} demo-app 2>/dev/null || true); if [ -n \"$previous_image\" ]; then printf \"IMAGE_REF=%s\\n\" \"$previous_image\" > .env.previous; else rm -f .env.previous; fi; fi",
+                ("printf \"IMAGE_REF=%s\\n\" " + ($image | @sh) + " > .env"),
+                "docker compose --env-file .env config --quiet",
+                "docker compose --env-file .env pull",
+                "docker run --rm --add-host demo-app:127.0.0.1 --volume /opt/demo-app/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro nginx:alpine nginx -t",
+                "touch .deployment-in-progress",
+                "docker compose --env-file .env down --remove-orphans >/dev/null 2>&1 || true",
+                "docker rm -f demo-app demo-app-nginx >/dev/null 2>&1 || true",
                 "systemctl disable --now nginx >/dev/null 2>&1 || true",
-                ("docker run -d --name demo-app --restart unless-stopped --init --network demo-app-observability --label logging=alloy --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --cap-drop ALL --security-opt no-new-privileges -p 8080:3000 -e PORT=3000 -e NAME=production " + $image),
-                "attempt=0; until [ \"$(docker inspect --format={{.State.Health.Status}} demo-app)\" = healthy ]; do attempt=$((attempt + 1)); [ \"$attempt\" -lt 31 ] || exit 1; sleep 2; done"
+                "docker compose --env-file .env up -d --remove-orphans",
+                "attempt=0; until [ \"$(docker inspect --format={{.State.Health.Status}} demo-app)\" = healthy ]; do attempt=$((attempt + 1)); [ \"$attempt\" -lt 31 ] || exit 1; sleep 2; done",
+                "attempt=0; until [ \"$(docker inspect --format={{.State.Health.Status}} demo-app-nginx)\" = healthy ]; do attempt=$((attempt + 1)); [ \"$attempt\" -lt 31 ] || exit 1; sleep 2; done",
+                "curl --fail --silent --show-error http://127.0.0.1:8080/health"
               ]
             }'
           )"
@@ -212,7 +251,13 @@ jobs:
             jq -cn '{
               commands: [
                 "set -eu",
-                "if docker container inspect demo-app-previous >/dev/null 2>&1; then docker rm -f demo-app >/dev/null 2>&1 || true; docker rename demo-app-previous demo-app; docker start demo-app; else docker rm -f demo-app >/dev/null 2>&1 || true; systemctl enable --now nginx; fi"
+                "cd /opt/demo-app",
+                "if [ ! -f .deployment-in-progress ]; then [ ! -s .env.previous ] || cp .env.previous .env; [ ! -f compose.yml.previous ] || cp compose.yml.previous compose.yml; [ ! -f nginx/default.conf.previous ] || cp nginx/default.conf.previous nginx/default.conf; exit 0; fi",
+                "docker compose --env-file .env down --remove-orphans >/dev/null 2>&1 || true",
+                "[ ! -f compose.yml.previous ] || cp compose.yml.previous compose.yml",
+                "[ ! -f nginx/default.conf.previous ] || cp nginx/default.conf.previous nginx/default.conf",
+                "if [ -s .env.previous ]; then cp .env.previous .env; docker compose --env-file .env config --quiet; docker compose --env-file .env pull; docker compose --env-file .env up -d --remove-orphans; attempt=0; until [ \"$(docker inspect --format={{.State.Health.Status}} demo-app)\" = healthy ] && [ \"$(docker inspect --format={{.State.Health.Status}} demo-app-nginx)\" = healthy ]; do attempt=$((attempt + 1)); [ \"$attempt\" -lt 31 ] || exit 1; sleep 2; done; curl --fail --silent --show-error http://127.0.0.1:8080/health; else docker rm -f demo-app demo-app-nginx >/dev/null 2>&1 || true; systemctl enable --now nginx; fi",
+                "rm -f .deployment-in-progress"
               ]
             }'
           )"
@@ -231,7 +276,7 @@ jobs:
             --command-id "$rollback_id" \
             --instance-id "$INSTANCE_ID"
 
-      - name: Remove previous container
+      - name: Clean up previous deployment
         if: success()
         shell: bash
         run: |
@@ -240,18 +285,26 @@ jobs:
           parameters="$(
             jq -cn '{
               commands: [
-                "docker rm -f demo-app-previous >/dev/null 2>&1 || true",
+                "cd /opt/demo-app",
+                "rm -f .env.previous compose.yml.previous nginx/default.conf.previous .deployment-in-progress",
                 "docker image prune -f"
               ]
             }'
           )"
 
-          aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name AWS-RunShellScript \
-            --comment "Clean up previous demo-app release" \
-            --parameters "$parameters" \
-            --output json >/dev/null
+          cleanup_id="$(
+            aws ssm send-command \
+              --instance-ids "$INSTANCE_ID" \
+              --document-name AWS-RunShellScript \
+              --comment "Clean up previous demo-app release" \
+              --parameters "$parameters" \
+              --query 'Command.CommandId' \
+              --output text
+          )"
+
+          aws ssm wait command-executed \
+            --command-id "$cleanup_id" \
+            --instance-id "$INSTANCE_ID"
 
       - name: Write deployment summary
         if: success()
@@ -264,5 +317,6 @@ jobs:
             echo "- Image: \`${IMAGE_REF}\`"
             echo "- Instance: \`${INSTANCE_ID}\`"
             echo "- URL: ${APPLICATION_URL}"
+            echo "- Traffic: ALB → Nginx → demo-app"
             echo "- Status: successful"
           } >> "$GITHUB_STEP_SUMMARY"
