@@ -9,8 +9,43 @@ permissions:
   contents: read
 
 jobs:
+  verify-release:
+    name: Verify release source
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v5
+
+      - name: Validate semantic version tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $GITHUB_REF_NAME"
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Run unit tests
+        run: npm test
+
   build-image:
     name: Build and publish release image
+    needs: verify-release
 
     permissions:
       contents: read
@@ -21,6 +56,8 @@ jobs:
     with:
       image_name: ghcr.io/${{ github.repository_owner }}/demo-app
       image_tag: ${{ github.ref_name }}
+      push_image: true
+      push_latest: true
 
     secrets: inherit
 
@@ -42,3 +79,190 @@ jobs:
           make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy-production:
+    name: Deploy to production
+    needs:
+      - build-image
+      - create-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+      id-token: write
+
+    environment:
+      name: production
+
+    concurrency:
+      group: demo-app-production
+      cancel-in-progress: false
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+      INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+      APPLICATION_URL: ${{ vars.APPLICATION_URL }}
+      IMAGE_REF: ${{ needs.build-image.outputs.image_ref }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: demo-app-deploy-${{ github.run_id }}
+
+      - name: Validate deployment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          : "${AWS_REGION:?AWS_REGION is required}"
+          : "${INSTANCE_ID:?EC2_INSTANCE_ID is required}"
+          : "${APPLICATION_URL:?APPLICATION_URL is required}"
+          : "${IMAGE_REF:?IMAGE_REF is required}"
+
+          aws sts get-caller-identity
+
+      - name: Deploy release through SSM
+        id: deploy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          parameters="$(
+            jq -cn --arg image "$IMAGE_REF" '{
+              commands: [
+                "set -eu",
+                ("docker pull " + $image),
+                "docker network inspect demo-app-observability >/dev/null",
+                "docker rm -f demo-app-previous >/dev/null 2>&1 || true",
+                "if docker container inspect demo-app >/dev/null 2>&1; then docker stop demo-app; docker rename demo-app demo-app-previous; fi",
+                "systemctl disable --now nginx >/dev/null 2>&1 || true",
+                ("docker run -d --name demo-app --restart unless-stopped --init --network demo-app-observability --label logging=alloy --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --cap-drop ALL --security-opt no-new-privileges -p 8080:3000 -e PORT=3000 -e NAME=production " + $image),
+                "attempt=0; until [ \"$(docker inspect --format={{.State.Health.Status}} demo-app)\" = healthy ]; do attempt=$((attempt + 1)); [ \"$attempt\" -lt 31 ] || exit 1; sleep 2; done"
+              ]
+            }'
+          )"
+
+          command_id="$(
+            aws ssm send-command \
+              --instance-ids "$INSTANCE_ID" \
+              --document-name AWS-RunShellScript \
+              --comment "Deploy ${IMAGE_REF}" \
+              --parameters "$parameters" \
+              --query 'Command.CommandId' \
+              --output text
+          )"
+
+          echo "command_id=${command_id}" >> "$GITHUB_OUTPUT"
+          echo "SSM command: ${command_id}"
+
+      - name: Wait for SSM deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws ssm wait command-executed \
+            --command-id "${{ steps.deploy.outputs.command_id }}" \
+            --instance-id "$INSTANCE_ID"
+
+      - name: Show SSM deployment output
+        if: always() && steps.deploy.outputs.command_id != ''
+        shell: bash
+        run: |
+          aws ssm get-command-invocation \
+            --command-id "${{ steps.deploy.outputs.command_id }}" \
+            --instance-id "$INSTANCE_ID" \
+            --query '{
+              Status:Status,
+              StandardOutput:StandardOutputContent,
+              StandardError:StandardErrorContent
+            }'
+
+      - name: Verify production health
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for attempt in $(seq 1 18); do
+            if curl --fail --silent --show-error \
+              "${APPLICATION_URL%/}/health"; then
+              echo
+              echo "Production health check passed"
+              exit 0
+            fi
+
+            echo "Health check attempt ${attempt}/18 failed"
+            sleep 10
+          done
+
+          echo "Production health check failed"
+          exit 1
+
+      - name: Roll back failed deployment
+        if: failure() && steps.deploy.outputs.command_id != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          parameters="$(
+            jq -cn '{
+              commands: [
+                "set -eu",
+                "if docker container inspect demo-app-previous >/dev/null 2>&1; then docker rm -f demo-app >/dev/null 2>&1 || true; docker rename demo-app-previous demo-app; docker start demo-app; else docker rm -f demo-app >/dev/null 2>&1 || true; systemctl enable --now nginx; fi"
+              ]
+            }'
+          )"
+
+          rollback_id="$(
+            aws ssm send-command \
+              --instance-ids "$INSTANCE_ID" \
+              --document-name AWS-RunShellScript \
+              --comment "Rollback failed demo-app deployment" \
+              --parameters "$parameters" \
+              --query 'Command.CommandId' \
+              --output text
+          )"
+
+          aws ssm wait command-executed \
+            --command-id "$rollback_id" \
+            --instance-id "$INSTANCE_ID"
+
+      - name: Remove previous container
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          parameters="$(
+            jq -cn '{
+              commands: [
+                "docker rm -f demo-app-previous >/dev/null 2>&1 || true",
+                "docker image prune -f"
+              ]
+            }'
+          )"
+
+          aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "Clean up previous demo-app release" \
+            --parameters "$parameters" \
+            --output json >/dev/null
+
+      - name: Write deployment summary
+        if: success()
+        shell: bash
+        run: |
+          {
+            echo "## Production deployment"
+            echo ""
+            echo "- Release: \`${GITHUB_REF_NAME}\`"
+            echo "- Image: \`${IMAGE_REF}\`"
+            echo "- Instance: \`${INSTANCE_ID}\`"
+            echo "- URL: ${APPLICATION_URL}"
+            echo "- Status: successful"
+          } >> "$GITHUB_STEP_SUMMARY"
