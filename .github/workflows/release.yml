@@ -74,9 +74,71 @@ jobs:
 
     secrets: inherit
 
+  sign-release-image:
+    name: Keyless sign release image
+    needs: build-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sign immutable release image
+        env:
+          IMAGE_DIGEST_REF: ${{ needs.build-image.outputs.image_digest_ref }}
+        run: |
+          set -euo pipefail
+
+          : "${IMAGE_DIGEST_REF:?image_digest_ref is required}"
+          cosign sign --yes "$IMAGE_DIGEST_REF"
+
+      - name: Write signed release metadata
+        env:
+          IMAGE_DIGEST_REF: ${{ needs.build-image.outputs.image_digest_ref }}
+        run: |
+          set -euo pipefail
+
+          install -d "$RUNNER_TEMP/signed-release-image"
+
+          jq -n \
+            --arg image_digest_ref "$IMAGE_DIGEST_REF" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$GITHUB_SHA" \
+            --arg source_ref "$GITHUB_REF" \
+            --arg signer_identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+            '{
+              schema_version: 1,
+              image_digest_ref: $image_digest_ref,
+              repository: $repository,
+              source_sha: $source_sha,
+              source_ref: $source_ref,
+              signer_identity: $signer_identity
+            }' > "$RUNNER_TEMP/signed-release-image/signed-image.json"
+
+      - name: Upload signed release metadata
+        uses: actions/upload-artifact@v7
+        with:
+          name: signed-release-image-${{ github.ref_name }}
+          path: ${{ runner.temp }}/signed-release-image/signed-image.json
+          if-no-files-found: error
+          retention-days: 7
+
   create-release:
     name: Create GitHub Release
-    needs: build-image
+    needs: sign-release-image
     runs-on: ubuntu-latest
 
     permissions:
@@ -96,13 +158,15 @@ jobs:
   deploy-production:
     name: Deploy to production
     needs:
-      - build-image
+      - sign-release-image
       - create-release
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     permissions:
+      actions: read
       contents: read
+      packages: read
       id-token: write
 
     environment:
@@ -117,11 +181,73 @@ jobs:
       AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
       INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
       APPLICATION_URL: ${{ vars.APPLICATION_URL }}
-      IMAGE_REF: ${{ needs.build-image.outputs.image_ref }}
 
     steps:
       - name: Checkout deployment configuration
         uses: actions/checkout@v5
+
+      - name: Download signed release metadata
+        uses: actions/download-artifact@v8
+        with:
+          name: signed-release-image-${{ github.ref_name }}
+          path: ${{ runner.temp }}/signed-release-image
+
+      - name: Validate signed release metadata
+        id: image
+        shell: bash
+        env:
+          METADATA_PATH: ${{ runner.temp }}/signed-release-image/signed-image.json
+          EXPECTED_SIGNER_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+        run: |
+          set -euo pipefail
+
+          test -s "$METADATA_PATH"
+
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$GITHUB_SHA" \
+            --arg source_ref "$GITHUB_REF" \
+            --arg signer_identity "$EXPECTED_SIGNER_IDENTITY" \
+            '.schema_version == 1 and
+             .repository == $repository and
+             .source_sha == $source_sha and
+             .source_ref == $source_ref and
+             .signer_identity == $signer_identity and
+             (.image_digest_ref | type == "string")' \
+            "$METADATA_PATH" >/dev/null
+
+          digest_ref="$(jq -r '.image_digest_ref' "$METADATA_PATH")"
+
+          if [[ ! "$digest_ref" =~ ^ghcr\.io/${GITHUB_REPOSITORY_OWNER}/demo-app@sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid image digest reference: $digest_ref" >&2
+            exit 1
+          fi
+
+          echo "digest_ref=${digest_ref}" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_REF=${digest_ref}" >> "$GITHUB_ENV"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify release image signature
+        env:
+          IMAGE_DIGEST_REF: ${{ steps.image.outputs.digest_ref }}
+        run: |
+          set -euo pipefail
+
+          cosign verify \
+            --certificate-identity \
+            "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer \
+            "https://token.actions.githubusercontent.com" \
+            "$IMAGE_DIGEST_REF"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
