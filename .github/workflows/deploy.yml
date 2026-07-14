@@ -1,36 +1,128 @@
 name: deploy
 
 on:
-  push:
+  workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: CI workflow run ID containing the signed image artifact
+        required: true
+        type: string
+
+      source_sha:
+        description: Full commit SHA used to name and validate the artifact
+        required: true
+        type: string
+
+  workflow_run:
+    workflows:
+      - ci
+    types:
+      - completed
     branches:
       - main
 
 permissions:
+  actions: read
   contents: read
+  packages: read
 
 concurrency:
-  group: deploy-${{ github.ref }}
+  group: deploy-staging
   cancel-in-progress: false
 
 jobs:
   deploy-staging:
     name: Deploy to staging
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
+    env:
+      CI_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.ci_run_id }}
+      SOURCE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.source_sha }}
+      SOURCE_BRANCH: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch || 'manual' }}
 
     environment:
       name: staging
 
     steps:
-      - name: Checkout source code
-        uses: actions/checkout@v5
+      - name: Download signed image metadata
+        uses: actions/download-artifact@v8
+        with:
+          name: signed-image-${{ env.SOURCE_SHA }}
+          path: ${{ runner.temp }}/signed-image
+          run-id: ${{ env.CI_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate signed image metadata
+        id: image
+        shell: bash
+        env:
+          METADATA_PATH: ${{ runner.temp }}/signed-image/signed-image.json
+          EXPECTED_SIGNER_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/ci-trivy.yml@refs/heads/main
+        run: |
+          set -euo pipefail
+
+          test -s "$METADATA_PATH"
+
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_ref "refs/heads/main" \
+            --arg signer_identity "$EXPECTED_SIGNER_IDENTITY" \
+            '.schema_version == 1 and
+             .repository == $repository and
+             .source_sha == $source_sha and
+             .source_ref == $source_ref and
+             .signer_identity == $signer_identity and
+             (.image_digest_ref | type == "string")' \
+            "$METADATA_PATH" >/dev/null
+
+          digest_ref="$(jq -r '.image_digest_ref' "$METADATA_PATH")"
+
+          if [[ ! "$digest_ref" =~ ^ghcr\.io/${GITHUB_REPOSITORY_OWNER}/demo-app@sha256:[0-9a-f]{64}$ ]]; then
+            echo "Invalid image digest reference: $digest_ref" >&2
+            exit 1
+          fi
+
+          echo "digest_ref=${digest_ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify image signature
+        env:
+          IMAGE_DIGEST_REF: ${{ steps.image.outputs.digest_ref }}
+        run: |
+          set -euo pipefail
+
+          cosign verify \
+            --certificate-identity \
+            "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci-trivy.yml@refs/heads/main" \
+            --certificate-oidc-issuer \
+            "https://token.actions.githubusercontent.com" \
+            "$IMAGE_DIGEST_REF"
 
       - name: Simulate staging deployment
         shell: bash
+        env:
+          IMAGE_DIGEST_REF: ${{ steps.image.outputs.digest_ref }}
         run: |
-          echo "Deploying to staging..."
-          echo "Commit: $GITHUB_SHA"
-          echo "Branch: $GITHUB_REF_NAME"
+          echo "Signature verification passed"
+          echo "Would deploy: $IMAGE_DIGEST_REF"
+          echo "Commit: $SOURCE_SHA"
+          echo "Branch: $SOURCE_BRANCH"
           echo "Environment: staging"
           echo "Staging deployment completed"
 
@@ -39,7 +131,8 @@ jobs:
           {
             echo "## Staging deployment"
             echo ""
-            echo "- Commit: \`$GITHUB_SHA\`"
-            echo "- Branch: \`$GITHUB_REF_NAME\`"
+            echo "- Commit: \`$SOURCE_SHA\`"
+            echo "- Image: \`${{ steps.image.outputs.digest_ref }}\`"
+            echo "- Signature: verified"
             echo "- Status: successful"
           } >> "$GITHUB_STEP_SUMMARY"

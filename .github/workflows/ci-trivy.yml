@@ -114,3 +114,66 @@ jobs:
       push_latest: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
     secrets: inherit
+
+  sign-image:
+    name: Keyless sign image
+    needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sign immutable image
+        env:
+          IMAGE_DIGEST_REF: ${{ needs.docker.outputs.image_digest_ref }}
+        run: |
+          set -euo pipefail
+
+          : "${IMAGE_DIGEST_REF:?image_digest_ref is required}"
+          cosign sign --yes "$IMAGE_DIGEST_REF"
+
+      - name: Write signed image metadata
+        env:
+          IMAGE_DIGEST_REF: ${{ needs.docker.outputs.image_digest_ref }}
+        run: |
+          set -euo pipefail
+
+          install -d "$RUNNER_TEMP/signed-image"
+
+          jq -n \
+            --arg image_digest_ref "$IMAGE_DIGEST_REF" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_sha "$GITHUB_SHA" \
+            --arg source_ref "$GITHUB_REF" \
+            --arg signer_identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/ci-trivy.yml@${GITHUB_REF}" \
+            '{
+              schema_version: 1,
+              image_digest_ref: $image_digest_ref,
+              repository: $repository,
+              source_sha: $source_sha,
+              source_ref: $source_ref,
+              signer_identity: $signer_identity
+            }' > "$RUNNER_TEMP/signed-image/signed-image.json"
+
+      - name: Upload signed image metadata
+        uses: actions/upload-artifact@v7
+        with:
+          name: signed-image-${{ github.sha }}
+          path: ${{ runner.temp }}/signed-image/signed-image.json
+          if-no-files-found: error
+          retention-days: 7

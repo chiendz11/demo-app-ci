@@ -30,6 +30,10 @@ on:
         description: Fully qualified image reference produced by the workflow
         value: ${{ jobs.build.outputs.image_ref }}
 
+      image_digest_ref:
+        description: Immutable image reference produced after pushing to the registry
+        value: ${{ jobs.build.outputs.image_digest_ref }}
+
 jobs:
   build:
     name: Build, scan, SBOM, and optionally push image
@@ -38,6 +42,7 @@ jobs:
 
     outputs:
       image_ref: ${{ steps.image.outputs.ref }}
+      image_digest_ref: ${{ steps.digest.outputs.ref }}
 
     permissions:
       contents: read
@@ -109,8 +114,30 @@ jobs:
         if: inputs.push_image
         shell: bash
         run: |
+          set -euo pipefail
+
           docker push "${{ inputs.image_name }}:${{ inputs.image_tag }}"
 
           if [[ "${{ inputs.push_latest }}" == "true" ]]; then
             docker push "${{ inputs.image_name }}:latest"
           fi
+
+      - name: Resolve immutable image digest
+        if: inputs.push_image
+        id: digest
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+
+          digest="$(
+            docker buildx imagetools inspect "$IMAGE_REF" \
+              --format '{{json .Manifest.Digest}}' |
+              tr -d '"'
+          )"
+
+          digest_ref="${IMAGE_REF%:*}@${digest}"
+
+          echo "ref=${digest_ref}" >> "$GITHUB_OUTPUT"
+          echo "Immutable image: ${digest_ref}"
